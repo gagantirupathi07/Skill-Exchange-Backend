@@ -18,82 +18,68 @@ import com.SkillExchange.notification.service.NotificationService;
 import com.SkillExchange.user.model.User;
 import com.SkillExchange.user.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class ExchangeService {
 
+    private static final ZoneId ZONE_ID =
+            ZoneId.of("Asia/Kolkata");
+
     private final ExchangeRepository exchangeRepository;
-
     private final UserRepository userRepository;
-
     private final ExchangeSessionRepository exchangeSessionRepository;
-
     private final CreditService creditService;
-
     private final NotificationService notificationService;
 
-
     /*
-     * Creates an Exchange from an accepted
-     * ExchangeRequest.
+     * Creates an Exchange from an accepted ExchangeRequest.
      */
     @Transactional
     public ExchangeResponse createFromAcceptedRequest(
             ExchangeRequest request
     ) {
 
-        if (request.getStatus()
-                != ExchangeRequestStatus.ACCEPTED) {
-
+        if (request.getStatus() != ExchangeRequestStatus.ACCEPTED) {
             throw new BadRequestException(
                     "Exchange can only be created from an accepted request"
             );
         }
 
-        if (exchangeRepository
-                .existsByExchangeRequest(request)) {
-
+        if (exchangeRepository.existsByExchangeRequest(request)) {
             throw new BadRequestException(
                     "Exchange already exists for this request"
             );
         }
 
-        User learner =
-                request.getSender();
+        User learner = request.getSender();
+        User teacher = request.getReceiver();
 
-        User teacher =
-                request.getReceiver();
+        Exchange exchange = Exchange.builder()
+                .exchangeRequest(request)
+                .teacher(teacher)
+                .learner(learner)
+                .skill(request.getRequestedSkill())
+                .status(ExchangeStatus.ACTIVE)
+                .build();
 
-        Exchange exchange =
-                Exchange.builder()
-                        .exchangeRequest(request)
-                        .teacher(teacher)
-                        .learner(learner)
-                        .skill(request.getRequestedSkill())
-                        .status(ExchangeStatus.ACTIVE)
-                        .build();
-
-        Exchange savedExchange =
-                exchangeRepository.save(exchange);
+        Exchange savedExchange = exchangeRepository.save(exchange);
 
         return mapToResponse(savedExchange);
     }
 
-
     /*
-     * Complete the overall Exchange.
-     *
-     * ONLY THE TEACHER CAN COMPLETE IT.
-     *
-     * The session must already have been
-     * confirmed by BOTH participants.
+     * Completes an exchange manually.
+     * Only the teacher can complete the exchange.
      */
     @Transactional
     public ExchangeCompletionResponse completeExchange(
@@ -101,292 +87,54 @@ public class ExchangeService {
             Long exchangeId
     ) {
 
-        User teacher =
-                userRepository
-                        .findByUsername(username)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "User not found"
-                                )
-                        );
+        User teacher = userRepository.findByUsername(username)
+                .orElseThrow(() ->
+                        new BadRequestException("User not found")
+                );
 
-        Exchange exchange =
-                exchangeRepository
-                        .findById(exchangeId)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "Exchange not found"
-                                )
-                        );
+        Exchange exchange = exchangeRepository.findById(exchangeId)
+                .orElseThrow(() ->
+                        new BadRequestException("Exchange not found")
+                );
 
-        /*
-         * ONLY teacher can complete
-         * the overall exchange.
-         */
-        if (!exchange.getTeacher()
-                .getId()
-                .equals(teacher.getId())) {
-
+        if (!exchange.getTeacher().getId().equals(teacher.getId())) {
             throw new ForbiddenException(
                     "Only the teacher can complete this exchange"
             );
         }
 
-        /*
-         * Prevent duplicate completion.
-         */
-        if (exchange.getStatus()
-                == ExchangeStatus.COMPLETED) {
-
+        if (exchange.getStatus() == ExchangeStatus.COMPLETED) {
             throw new BadRequestException(
                     "Exchange is already completed"
             );
         }
 
-        /*
-         * Exchange must be ACTIVE.
-         */
-        if (exchange.getStatus()
-                != ExchangeStatus.ACTIVE) {
-
+        if (exchange.getStatus() != ExchangeStatus.ACTIVE) {
             throw new BadRequestException(
                     "Only an active exchange can be completed"
             );
         }
 
-        /*
-         * Find the scheduled session.
-         */
         List<ExchangeSession> sessions =
-                exchangeSessionRepository
-                        .findByExchange(exchange);
+                exchangeSessionRepository.findByExchange(exchange);
 
-        ExchangeSession session =
-                sessions.stream()
-                        .filter(s ->
-                                s.getStatus()
-                                        == SessionStatus.SCHEDULED
+        ExchangeSession session = sessions.stream()
+                .filter(s -> s.getStatus() == SessionStatus.SCHEDULED)
+                .findFirst()
+                .orElseThrow(() ->
+                        new BadRequestException(
+                                "No scheduled session found for this exchange"
                         )
-                        .findFirst()
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "No scheduled session found for this exchange"
-                                )
-                        );
-
-        /*
-         * Calculate session end time.
-         */
-        LocalDateTime sessionEnd =
-                LocalDateTime.of(
-                        session.getScheduledDate(),
-                        session.getEndTime()
                 );
 
-        /*
-         * Session must already be finished.
-         */
-        if (LocalDateTime.now()
-                .isBefore(sessionEnd)) {
-
+        if (session.getScheduledDate() == null
+                || session.getEndTime() == null) {
             throw new BadRequestException(
-                    "The session cannot be completed before it ends"
+                    "The session's scheduled date or end time is missing"
             );
         }
 
-        /*
-         * Mark session as completed.
-         *
-         * We keep both confirmation fields TRUE
-         * for compatibility with the existing model.
-         */
-        LocalDateTime completedAt =
-                LocalDateTime.now();
-
-        session.setTeacherConfirmed(true);
-        session.setTeacherConfirmedAt(completedAt);
-
-        session.setLearnerConfirmed(true);
-        session.setLearnerConfirmedAt(completedAt);
-
-        session.setStatus(
-                SessionStatus.COMPLETED
-        );
-
-        session.setCompletedAt(
-                completedAt
-        );
-
-        exchangeSessionRepository.save(session);
-
-        /*
-         * Calculate credits from session duration.
-         */
-        BigDecimal credits =
-                creditService.calculateCredits(
-                        session.getDurationMinutes()
-                );
-
-        /*
-         * Store credit amount in exchange.
-         */
-        exchange.setCreditAmount(credits);
-
-        /*
-         * Transfer:
-         *
-         * learner → teacher
-         *
-         * If this fails, the entire transaction
-         * will roll back.
-         */
-        creditService.transferCredits(
-                exchange,
-                credits
-        );
-
-        /*
-         * Mark exchange completed.
-         */
-        exchange.setStatus(
-                ExchangeStatus.COMPLETED
-        );
-
-        exchange.setCompletedAt(
-                completedAt
-        );
-
-        Exchange savedExchange =
-                exchangeRepository.save(exchange);
-
-        /*
-         * Notify teacher.
-         */
-        notificationService.createNotification(
-                savedExchange.getTeacher(),
-                NotificationType.EXCHANGE_COMPLETED,
-                "Exchange Completed",
-                "Your "
-                        + savedExchange.getSkill().getName()
-                        + " skill exchange has been completed successfully.",
-                savedExchange.getId()
-        );
-
-        /*
-         * Notify learner.
-         */
-        notificationService.createNotification(
-                savedExchange.getLearner(),
-                NotificationType.EXCHANGE_COMPLETED,
-                "Exchange Completed",
-                "Your "
-                        + savedExchange.getSkill().getName()
-                        + " skill exchange has been completed successfully.",
-                savedExchange.getId()
-        );
-
-        /*
-         * Notify teacher about earned credits.
-         */
-        notificationService.createNotification(
-                savedExchange.getTeacher(),
-                NotificationType.CREDITS_EARNED,
-                "Credits Earned",
-                "You earned "
-                        + credits
-                        + " credits for teaching "
-                        + savedExchange.getSkill().getName()
-                        + ".",
-                savedExchange.getId()
-        );
-
-        /*
-         * Notify learner about spent credits.
-         */
-        notificationService.createNotification(
-                savedExchange.getLearner(),
-                NotificationType.CREDITS_SPENT,
-                "Credits Spent",
-                credits
-                        + " credits were spent for learning "
-                        + savedExchange.getSkill().getName()
-                        + ".",
-                savedExchange.getId()
-        );
-
-        /*
-         * Return completion response.
-         */
-        return ExchangeCompletionResponse.builder()
-
-                .exchangeId(
-                        savedExchange.getId()
-                )
-
-                .sessionId(
-                        session.getId()
-                )
-
-                .teacherUsername(
-                        savedExchange
-                                .getTeacher()
-                                .getUsername()
-                )
-
-                .learnerUsername(
-                        savedExchange
-                                .getLearner()
-                                .getUsername()
-                )
-
-                .skillName(
-                        savedExchange
-                                .getSkill()
-                                .getName()
-                )
-
-                .durationMinutes(
-                        session.getDurationMinutes()
-                )
-
-                .creditsTransferred(
-                        credits
-                )
-
-                .exchangeStatus(
-                        savedExchange.getStatus()
-                )
-
-                .completedAt(
-                        completedAt
-                )
-
-                .message(
-                        "Exchange completed and credits transferred successfully"
-                )
-
-                .build();
-    }
-    @Transactional
-    public void completeExchangeAutomatically(Long sessionId) {
-
-        ExchangeSession session = exchangeSessionRepository
-                .findById(sessionId)
-                .orElse(null);
-
-        if (session == null
-                || session.getStatus() != SessionStatus.SCHEDULED) {
-            return;
-        }
-
-        Exchange exchange = session.getExchange();
-
-        // Never transfer credits twice for an already completed exchange.
-        if (exchange.getStatus() != ExchangeStatus.ACTIVE) {
-            return;
-        }
-
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = LocalDateTime.now(ZONE_ID);
 
         LocalDateTime sessionEnd = LocalDateTime.of(
                 session.getScheduledDate(),
@@ -394,108 +142,321 @@ public class ExchangeService {
         );
 
         if (now.isBefore(sessionEnd)) {
+            throw new BadRequestException(
+                    "The session cannot be completed before it ends"
+            );
+        }
+
+        completeSessionAndTransferCredits(
+                exchange,
+                session,
+                now
+        );
+
+        Exchange savedExchange = exchangeRepository.save(exchange);
+
+        return buildCompletionResponse(
+                savedExchange,
+                session,
+                exchange.getCreditAmount(),
+                now
+        );
+    }
+
+    /*
+     * Automatically completes an ended session.
+     *
+     * This method must remain transactional so that a failure
+     * during credit transfer rolls back the session and exchange
+     * completion changes.
+     */
+    @Transactional
+    public void completeExchangeAutomatically(Long sessionId) {
+
+        log.info(
+                "AUTO-COMPLETION SERVICE: Started for session {}",
+                sessionId
+        );
+
+        ExchangeSession session = exchangeSessionRepository
+                .findById(sessionId)
+                .orElse(null);
+
+        if (session == null) {
+            log.warn(
+                    "AUTO-COMPLETION SERVICE: Session {} does not exist",
+                    sessionId
+            );
             return;
         }
 
-        // Complete the session.
+        log.info(
+                "AUTO-COMPLETION SERVICE: Session {}, status={}, date={}, endTime={}",
+                session.getId(),
+                session.getStatus(),
+                session.getScheduledDate(),
+                session.getEndTime()
+        );
+
+        if (session.getStatus() != SessionStatus.SCHEDULED) {
+            log.info(
+                    "AUTO-COMPLETION SERVICE: Skipping session {} because its status is {}",
+                    sessionId,
+                    session.getStatus()
+            );
+            return;
+        }
+
+        Exchange exchange = session.getExchange();
+
+        if (exchange == null) {
+            log.error(
+                    "AUTO-COMPLETION SERVICE: Session {} has no associated exchange",
+                    sessionId
+            );
+            throw new IllegalStateException(
+                    "Session has no associated exchange"
+            );
+        }
+
+        log.info(
+                "AUTO-COMPLETION SERVICE: Exchange {}, status={}",
+                exchange.getId(),
+                exchange.getStatus()
+        );
+
+        if (exchange.getStatus() != ExchangeStatus.ACTIVE) {
+            log.info(
+                    "AUTO-COMPLETION SERVICE: Skipping session {} because exchange {} is {}",
+                    sessionId,
+                    exchange.getId(),
+                    exchange.getStatus()
+            );
+            return;
+        }
+
+        if (session.getScheduledDate() == null
+                || session.getEndTime() == null) {
+            throw new IllegalStateException(
+                    "Session " + sessionId
+                            + " is missing its scheduled date or end time"
+            );
+        }
+
+        LocalDateTime now = LocalDateTime.now(ZONE_ID);
+
+        LocalDateTime sessionEnd = LocalDateTime.of(
+                session.getScheduledDate(),
+                session.getEndTime()
+        );
+
+        log.info(
+                "AUTO-COMPLETION SERVICE: Session {}, current IST={}, session end IST={}",
+                sessionId,
+                now,
+                sessionEnd
+        );
+
+        if (now.isBefore(sessionEnd)) {
+            log.info(
+                    "AUTO-COMPLETION SERVICE: Skipping session {} because it has not ended",
+                    sessionId
+            );
+            return;
+        }
+
+        log.info(
+                "AUTO-COMPLETION SERVICE: Completing session {} and transferring credits",
+                sessionId
+        );
+
+        completeSessionAndTransferCredits(
+                exchange,
+                session,
+                now
+        );
+
+        exchangeRepository.save(exchange);
+
+        log.info(
+                "AUTO-COMPLETION SERVICE: Session {} and exchange {} completed successfully; credits transferred={}",
+                sessionId,
+                exchange.getId(),
+                exchange.getCreditAmount()
+        );
+    }
+
+    /*
+     * Shared transactional completion logic.
+     *
+     * The session and exchange are updated in the same transaction
+     * as the credit transfer. A transfer failure must roll back
+     * these database changes.
+     */
+    private void completeSessionAndTransferCredits(
+            Exchange exchange,
+            ExchangeSession session,
+            LocalDateTime completedAt
+    ) {
+
+        if (exchange.getStatus() != ExchangeStatus.ACTIVE) {
+            throw new BadRequestException(
+                    "Only an active exchange can be completed"
+            );
+        }
+
+        if (session.getStatus() != SessionStatus.SCHEDULED) {
+            throw new BadRequestException(
+                    "Only a scheduled session can be completed"
+            );
+        }
+
+        if (session.getDurationMinutes() == null
+                || session.getDurationMinutes() <= 0) {
+            throw new BadRequestException(
+                    "Session duration must be greater than zero"
+            );
+        }
+
         session.setTeacherConfirmed(true);
-        session.setTeacherConfirmedAt(now);
+        session.setTeacherConfirmedAt(completedAt);
+
         session.setLearnerConfirmed(true);
-        session.setLearnerConfirmedAt(now);
+        session.setLearnerConfirmedAt(completedAt);
+
         session.setStatus(SessionStatus.COMPLETED);
-        session.setCompletedAt(now);
+        session.setCompletedAt(completedAt);
 
         exchangeSessionRepository.save(session);
 
-        // Calculate and transfer credits using the existing service.
         BigDecimal credits = creditService.calculateCredits(
                 session.getDurationMinutes()
         );
 
+        if (credits == null || credits.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BadRequestException(
+                    "Calculated session credits must be greater than zero"
+            );
+        }
+
         exchange.setCreditAmount(credits);
 
+        /*
+         * Transfer credits before finalizing the exchange.
+         * If this fails, the surrounding transaction should roll back.
+         */
         creditService.transferCredits(exchange, credits);
 
-        // Complete the exchange.
         exchange.setStatus(ExchangeStatus.COMPLETED);
-        exchange.setCompletedAt(now);
+        exchange.setCompletedAt(completedAt);
 
-        Exchange savedExchange = exchangeRepository.save(exchange);
+        notifyParticipants(exchange, credits);
 
-        // Notify both participants.
+        log.info(
+                "EXCHANGE COMPLETION: Exchange {}, session {}, credits={}",
+                exchange.getId(),
+                session.getId(),
+                credits
+        );
+    }
+
+    /*
+     * Sends completion and credit notifications to both participants.
+     */
+    private void notifyParticipants(
+            Exchange exchange,
+            BigDecimal credits
+    ) {
+
         notificationService.createNotification(
-                savedExchange.getTeacher(),
+                exchange.getTeacher(),
                 NotificationType.EXCHANGE_COMPLETED,
                 "Exchange Completed",
-                "Your " + savedExchange.getSkill().getName()
+                "Your " + exchange.getSkill().getName()
                         + " skill exchange has been completed successfully.",
-                savedExchange.getId()
+                exchange.getId()
         );
 
         notificationService.createNotification(
-                savedExchange.getLearner(),
+                exchange.getLearner(),
                 NotificationType.EXCHANGE_COMPLETED,
                 "Exchange Completed",
-                "Your " + savedExchange.getSkill().getName()
+                "Your " + exchange.getSkill().getName()
                         + " skill exchange has been completed successfully.",
-                savedExchange.getId()
+                exchange.getId()
         );
 
         notificationService.createNotification(
-                savedExchange.getTeacher(),
+                exchange.getTeacher(),
                 NotificationType.CREDITS_EARNED,
                 "Credits Earned",
                 "You earned " + credits
                         + " credits for teaching "
-                        + savedExchange.getSkill().getName() + ".",
-                savedExchange.getId()
+                        + exchange.getSkill().getName() + ".",
+                exchange.getId()
         );
 
         notificationService.createNotification(
-                savedExchange.getLearner(),
+                exchange.getLearner(),
                 NotificationType.CREDITS_SPENT,
                 "Credits Spent",
                 credits + " credits were spent for learning "
-                        + savedExchange.getSkill().getName() + ".",
-                savedExchange.getId()
+                        + exchange.getSkill().getName() + ".",
+                exchange.getId()
         );
     }
+
+    /*
+     * Builds the response for manual completion.
+     */
+    private ExchangeCompletionResponse buildCompletionResponse(
+            Exchange exchange,
+            ExchangeSession session,
+            BigDecimal credits,
+            LocalDateTime completedAt
+    ) {
+
+        return ExchangeCompletionResponse.builder()
+                .exchangeId(exchange.getId())
+                .sessionId(session.getId())
+                .teacherUsername(exchange.getTeacher().getUsername())
+                .learnerUsername(exchange.getLearner().getUsername())
+                .skillName(exchange.getSkill().getName())
+                .durationMinutes(session.getDurationMinutes())
+                .creditsTransferred(credits)
+                .exchangeStatus(exchange.getStatus())
+                .completedAt(completedAt)
+                .message(
+                        "Exchange completed and credits transferred successfully"
+                )
+                .build();
+    }
+
     @Transactional(readOnly = true)
     public ExchangeResponse getExchangeById(
             String username,
             Long exchangeId
     ) {
 
-        User user =
-                userRepository
-                        .findByUsername(username)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "User not found"
-                                )
-                        );
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() ->
+                        new BadRequestException("User not found")
+                );
 
-        Exchange exchange =
-                exchangeRepository
-                        .findById(exchangeId)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "Exchange not found"
-                                )
-                        );
+        Exchange exchange = exchangeRepository.findById(exchangeId)
+                .orElseThrow(() ->
+                        new BadRequestException("Exchange not found")
+                );
 
-        boolean isTeacher =
-                exchange.getTeacher()
-                        .getId()
-                        .equals(user.getId());
+        boolean isTeacher = exchange.getTeacher()
+                .getId()
+                .equals(user.getId());
 
-        boolean isLearner =
-                exchange.getLearner()
-                        .getId()
-                        .equals(user.getId());
+        boolean isLearner = exchange.getLearner()
+                .getId()
+                .equals(user.getId());
 
         if (!isTeacher && !isLearner) {
-
             throw new ForbiddenException(
                     "You are not a participant in this exchange"
             );
@@ -504,173 +465,72 @@ public class ExchangeService {
         return mapToResponse(exchange);
     }
 
-
     @Transactional(readOnly = true)
-    public List<ExchangeResponse> getMyExchanges(
-            String username
-    ) {
+    public List<ExchangeResponse> getMyExchanges(String username) {
 
-        User user =
-                userRepository
-                        .findByUsername(username)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "User not found"
-                                )
-                        );
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() ->
+                        new BadRequestException("User not found")
+                );
 
-        return exchangeRepository
-                .findByTeacherOrLearner(user, user)
+        return exchangeRepository.findByTeacherOrLearner(user, user)
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
     }
 
-
     @Transactional(readOnly = true)
-    public List<ExchangeResponse> getTeachingExchanges(
-            String username
-    ) {
+    public List<ExchangeResponse> getTeachingExchanges(String username) {
 
-        User user =
-                userRepository
-                        .findByUsername(username)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "User not found"
-                                )
-                        );
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() ->
+                        new BadRequestException("User not found")
+                );
 
-        return exchangeRepository
-                .findByTeacher(user)
+        return exchangeRepository.findByTeacher(user)
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
     }
 
-
     @Transactional(readOnly = true)
-    public List<ExchangeResponse> getLearningExchanges(
-            String username
-    ) {
+    public List<ExchangeResponse> getLearningExchanges(String username) {
 
-        User user =
-                userRepository
-                        .findByUsername(username)
-                        .orElseThrow(() ->
-                                new BadRequestException(
-                                        "User not found"
-                                )
-                        );
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() ->
+                        new BadRequestException("User not found")
+                );
 
-        return exchangeRepository
-                .findByLearner(user)
+        return exchangeRepository.findByLearner(user)
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
     }
 
-
-    private ExchangeResponse mapToResponse(
-            Exchange exchange
-    ) {
+    private ExchangeResponse mapToResponse(Exchange exchange) {
 
         return ExchangeResponse.builder()
-
                 .id(exchange.getId())
-
-                .exchangeRequestId(
-                        exchange
-                                .getExchangeRequest()
-                                .getId()
-                )
-
-                .teacherId(
-                        exchange
-                                .getTeacher()
-                                .getId()
-                )
-
-                .teacherUsername(
-                        exchange
-                                .getTeacher()
-                                .getUsername()
-                )
-
-                .teacherFirstName(
-                        exchange
-                                .getTeacher()
-                                .getFirstName()
-                )
-
-                .teacherLastName(
-                        exchange
-                                .getTeacher()
-                                .getLastName()
-                )
-
-                .learnerId(
-                        exchange
-                                .getLearner()
-                                .getId()
-                )
-
-                .learnerUsername(
-                        exchange
-                                .getLearner()
-                                .getUsername()
-                )
-
-                .learnerFirstName(
-                        exchange
-                                .getLearner()
-                                .getFirstName()
-                )
-
-                .learnerLastName(
-                        exchange
-                                .getLearner()
-                                .getLastName()
-                )
-
-                .skillId(
-                        exchange
-                                .getSkill()
-                                .getId()
-                )
-
-                .skillName(
-                        exchange
-                                .getSkill()
-                                .getName()
-                )
-
-                .creditAmount(
-                        exchange.getCreditAmount()
-                )
-
-                .status(
-                        exchange.getStatus()
-                )
-
-                .startedAt(
-                        exchange.getStartedAt()
-                )
-
-                .completedAt(
-                        exchange.getCompletedAt()
-                )
-
-                .createdAt(
-                        exchange.getCreatedAt()
-                )
-
-                .updatedAt(
-                        exchange.getUpdatedAt()
-                )
-
+                .exchangeRequestId(exchange.getExchangeRequest().getId())
+                .teacherId(exchange.getTeacher().getId())
+                .teacherUsername(exchange.getTeacher().getUsername())
+                .teacherFirstName(exchange.getTeacher().getFirstName())
+                .teacherLastName(exchange.getTeacher().getLastName())
+                .learnerId(exchange.getLearner().getId())
+                .learnerUsername(exchange.getLearner().getUsername())
+                .learnerFirstName(exchange.getLearner().getFirstName())
+                .learnerLastName(exchange.getLearner().getLastName())
+                .skillId(exchange.getSkill().getId())
+                .skillName(exchange.getSkill().getName())
+                .creditAmount(exchange.getCreditAmount())
+                .status(exchange.getStatus())
+                .startedAt(exchange.getStartedAt())
+                .completedAt(exchange.getCompletedAt())
+                .createdAt(exchange.getCreatedAt())
+                .updatedAt(exchange.getUpdatedAt())
                 .build();
     }
+
     @Transactional(readOnly = true)
     public List<ExchangeResponse> getAllExchangesForAdmin() {
 
