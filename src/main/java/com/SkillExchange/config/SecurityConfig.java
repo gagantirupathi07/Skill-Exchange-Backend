@@ -63,8 +63,9 @@ public class SecurityConfig {
         CorsConfiguration configuration = new CorsConfiguration();
 
         configuration.setAllowedOrigins(List.of(
-                "https://skill-exchange-frontend-cks6.vercel.app/"
-        ));
+    "https://skill-exchange-frontend-cks6.vercel.app",
+    "http://localhost:5173"
+));
 
         configuration.setAllowedMethods(List.of(
                 "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"
