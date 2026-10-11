@@ -41,6 +41,29 @@ public class ExchangeAutoCompletionScheduler {
                 "AUTO-COMPLETION: Found {} scheduled sessions to inspect",
                 sessions.size()
         );
+        log.info(
+        "AUTO-COMPLETION DEBUG: Current date={}, session count={}",
+        LocalDate.now(),
+        sessions.size()
+);
+
+List<ExchangeSession> allScheduledSessions =
+        exchangeSessionRepository.findByStatus(
+                SessionStatus.SCHEDULED
+        );
+
+log.info(
+        "AUTO-COMPLETION DEBUG: All SCHEDULED sessions={}",
+        allScheduledSessions.stream()
+                .map(session -> String.format(
+                        "id=%s, date=%s, endTime=%s, exchangeId=%s",
+                        session.getId(),
+                        session.getScheduledDate(),
+                        session.getEndTime(),
+                        session.getExchange().getId()
+                ))
+                .toList()
+);
 
         for (ExchangeSession session : sessions) {
 
